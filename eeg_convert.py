@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import h5py
 import numpy as np
+import tables  # enables BLOSC
 from tqdm import tqdm
 
 from cmlreaders import CMLReader, PathFinder
@@ -28,9 +29,6 @@ def split_to_hdf5(subject: str, experiment: str, session: int,
     reader = CMLReader(subject, experiment, session, rootdir=rootdir)
     finder = reader.path_finder
     sources_filename = finder.find("sources")
-
-    compression = "gzip" if compress else None
-    compression_level = 4
 
     with open(sources_filename, "r") as infile:
         sources = json.load(infile)
@@ -62,16 +60,17 @@ def split_to_hdf5(subject: str, experiment: str, session: int,
                 data = np.fromfile(str(filename), dtype=dtype)
 
                 if dset is None:
-                    shape = (len(sources), len(data), num_channels)
+                    shape = (len(sources), num_channels, len(data))
                     dset = hfile.create_dataset(
                         "eeg", shape,
                         dtype=info["data_format"],
                         chunks=True,
-                        compression=compression,
-                        compression_opts=compression_level
+                        compression=(32001 if compress else None),
+                        # compression_opts=9,
+                        # shuffle=True,
                     )
 
-                dset[dset_num, :, ch] = data
+                dset[dset_num, ch] = data
 
         start_dset = hfile.create_dataset("start_time", data=start_timestamps)
         start_dset.attrs["desc"] = b"unix timestamp of session start"
@@ -88,7 +87,8 @@ def main():
 
     args = parser.parse_args()
 
-    split_to_hdf5(args.subject, args.experiment, args.session, args.outpath)
+    split_to_hdf5(args.subject, args.experiment, args.session, args.outpath,
+                  compress=False)
 
 
 if __name__ == "__main__":
