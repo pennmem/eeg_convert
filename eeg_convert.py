@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Optional, Union
 
 import h5py
@@ -12,70 +13,103 @@ from cmlreaders import CMLReader, PathFinder
 from cmlreaders.util import get_root_dir
 
 
-def split_to_hdf5(subject: str, experiment: str, session: int,
-                  outpath: Union[str, Path], compress: bool = True,
-                  rootdir: Optional[str] = None):
-    """Convert "split" EEG format to HDF5.
+class EEGConverter(object):
+    def __init__(self, subject, experiment, session, outdir, rootdir=None):
+        self.rootdir = get_root_dir(rootdir)
+        self.outdir = Path(self.rootdir).joinpath(outdir)
+        self.reader = CMLReader(subject, experiment, session, rootdir=rootdir)
 
-    :param subject:
-    :param experiment:
-    :param session:
-    :param outpath: location to write the HDF5 file to
-    :param compress: use compression when True
-    :param rootdir: path to rhino root
+        sources_filename = self.reader.path_finder.find("sources")
+        with open(sources_filename, "r") as infile:
+            self.sources = json.load(infile)
 
-    """
-    rootdir = get_root_dir(rootdir)
-    reader = CMLReader(subject, experiment, session, rootdir=rootdir)
-    finder = reader.path_finder
-    sources_filename = finder.find("sources")
+        self.eeg_files = [
+            sorted(
+                Path(sources_filename)
+                .parent
+                .joinpath("noreref")
+                .glob(info["name"] + "*")
+            ) for info in self.sources.values()
+        ]
 
-    with open(sources_filename, "r") as infile:
-        sources = json.load(infile)
+    @property
+    def num_channels(self):
+        return len(self.eeg_files[0])
 
-    outpath = Path(rootdir).joinpath(outpath, "eeg_timeseries.h5")
+    @property
+    def dtype(self):
+        for sources in self.sources.values():
+            return sources["data_format"]
 
-    with h5py.File(outpath, "w") as hfile:
-        contacts = reader.load("contacts")
+    def labels_as_array(self) -> np.ndarray:
+        contacts = self.reader.load("contacts")
         strlen = contacts.label.str.len().max()
         labels = contacts.label.values.astype(f"|S{strlen}")
-        hfile.create_dataset("labels", data=labels, chunks=True, compression="gzip")
-        start_timestamps = []
+        return labels
 
-        for dset_num, info in tqdm(enumerate(sources.values())):
-            dtype = info["data_format"]
-            sample_rate = info["sample_rate"]
-            start_timestamps.append(info["start_time_ms"] / 1000.)
+    def to_hdf5(self, filename="eeg_timeseries.h5"):
+        """Convert to HDF5."""
+        outpath = self.outdir.joinpath(filename)
 
-            files = sorted(
-                Path(sources_filename).parent
-                                      .joinpath("noreref")
-                                      .glob(info["name"] + "*")
-            )
+        with h5py.File(outpath, "w") as hfile:
+            labels = self.labels_as_array()
+            hfile.create_dataset("labels", data=labels, chunks=True,
+                                 compression="gzip")
+            start_timestamps = []
 
-            num_channels = len(files)
-            dset = None
+            for dset_num, info in tqdm(enumerate(self.sources.values())):
+                dtype = info["data_format"]
+                sample_rate = info["sample_rate"]
+                start_timestamps.append(info["start_time_ms"] / 1000.)
 
-            for ch, filename in tqdm(enumerate(files)):
-                data = np.fromfile(str(filename), dtype=dtype)
+                files = self.eeg_files[dset_num]
+                num_channels = len(files)
+                dset = None
 
-                if dset is None:
-                    shape = (len(sources), num_channels, len(data))
-                    dset = hfile.create_dataset(
-                        "eeg", shape,
-                        dtype=info["data_format"],
-                        chunks=True,
-                        compression=(32001 if compress else None),
-                        # compression_opts=9,
-                        # shuffle=True,
-                    )
+                for ch, filename in tqdm(enumerate(files)):
+                    data = np.fromfile(str(filename), dtype=dtype)
 
-                dset[dset_num, ch] = data
+                    if dset is None:
+                        shape = (len(self.sources), num_channels, len(data))
+                        dset = hfile.create_dataset(
+                            "eeg", shape,
+                            dtype=info["data_format"],
+                            # chunks=True,
+                            # compression=(32001 if compress else None),
+                            # compression_opts=9,
+                            # shuffle=True,
+                        )
 
-        start_dset = hfile.create_dataset("start_time", data=start_timestamps)
-        start_dset.attrs["desc"] = b"unix timestamp of session start"
+                    dset[dset_num, ch] = data
 
-        hfile.create_dataset("sample_rate", data=sample_rate)
+            start_dset = hfile.create_dataset("start_time", data=start_timestamps)
+            start_dset.attrs["desc"] = b"unix timestamp of session start"
+
+            hfile.create_dataset("sample_rate", data=sample_rate)
+
+    def to_npz(self, filename="eeg_timeseries.npy"):
+        """Convert to numpy's format."""
+        outpath = self.outdir.joinpath(filename)
+
+        arrays = {"labels": self.labels_as_array()}
+        eeg = None
+
+        for dset_num, info in tqdm(enumerate(self.sources.values())):
+            files = self.eeg_files[dset_num]
+
+            for ch, path in tqdm(enumerate(files)):
+                with path.open() as f:
+                    data = np.fromfile(f, dtype=self.dtype)
+
+                if eeg is None:
+                    shape = (len(self.sources), self.num_channels, data.shape[0])
+                    eeg = np.empty(shape, dtype=self.dtype)
+
+                eeg[dset_num, ch] = data
+
+        arrays["eeg"] = eeg
+        np.save(outpath, eeg, allow_pickle=False)
+        # np.savez(outpath, **arrays)
 
 
 def main():
@@ -83,12 +117,13 @@ def main():
     parser.add_argument("--subject", "-s", type=str, default="R1111M")
     parser.add_argument("--experiment", "-x", type=str, default="FR1")
     parser.add_argument("--session", "-n", type=int, default=0)
-    parser.add_argument("--outpath", "-o", type=str, default="scratch/depalati")
+    parser.add_argument("--outdir", "-o", type=str, default="scratch/depalati")
 
     args = parser.parse_args()
 
-    split_to_hdf5(args.subject, args.experiment, args.session, args.outpath,
-                  compress=False)
+    converter = EEGConverter(args.subject, args.experiment, args.session, args.outdir)
+    # converter.to_npz()
+    converter.to_hdf5("no_chunks.h5")
 
 
 if __name__ == "__main__":
